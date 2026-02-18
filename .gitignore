@@ -210,3 +210,5 @@ __marimo__/
 dataset/
 .venv3.6/
 .venv/
+weights/
+output/
