@@ -16,4 +16,5 @@ matplotlib
 seaborn
 wandb
 tifffile
+mrcfile
 matplotlib
