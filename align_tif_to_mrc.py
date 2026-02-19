@@ -57,6 +57,23 @@ def normalize_for_matching(image: np.ndarray) -> np.ndarray:
     return (image - image_min) / (image_max - image_min)
 
 
+def binarize_annotation_volume(volume: np.ndarray) -> np.ndarray:
+    volume = volume.astype(np.float32, copy=False)
+    value_min = float(volume.min())
+    value_max = float(volume.max())
+    if value_max <= value_min:
+        return np.zeros_like(volume, dtype=bool)
+
+    epsilon = max(1e-6, 1e-4 * (value_max - value_min))
+    sample = volume[::8, ::8, ::8]
+    near_max_count = int(np.count_nonzero(sample >= (value_max - epsilon)))
+    near_min_count = int(np.count_nonzero(sample <= (value_min + epsilon)))
+
+    if near_max_count >= near_min_count:
+        return volume < (value_max - epsilon)
+    return volume > (value_min + epsilon)
+
+
 def compute_depth_profile(volume: np.ndarray) -> np.ndarray:
     return volume.mean(axis=(1, 2))
 
@@ -251,10 +268,18 @@ def merge_tifs_into_class_volume(
     output_volume_shape: tuple[int, int, int],
     output_tif_path: Path,
 ) -> None:
-    merged_class_ids = np.zeros(output_volume_shape, dtype=np.uint16)
-    merged_class_scores = np.full(output_volume_shape, -np.inf, dtype=np.float32)
+    _ = merged_raw_volume
+    merged_class_volume = np.full(output_volume_shape, 255, dtype=np.uint8)
 
-    for class_id, result in enumerate(results, start=1):
+    num_classes = len(results)
+    if num_classes == 0:
+        output_tif_path.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(output_tif_path, merged_class_volume, imagej=True)
+        return
+
+    class_values = np.linspace(32, 224, num_classes, dtype=np.uint8)
+
+    for class_index, result in enumerate(results):
         tif_volume = read_volume_any(result.tif_path)
         tif_depth, tif_height, tif_width = tif_volume.shape
         z_start, y_start, x_start = result.z_offset, result.y_offset, result.x_offset
@@ -266,35 +291,15 @@ def merge_tifs_into_class_volume(
             continue
 
         tif_crop = tif_volume[: z_end - z_start, : y_end - y_start, : x_end - x_start]
-        tif_min = float(tif_crop.min())
-        tif_max = float(tif_crop.max())
-        if tif_max <= tif_min:
+        class_mask = binarize_annotation_volume(tif_crop)
+        if not np.any(class_mask):
             continue
-        threshold = 0.5 * (tif_min + tif_max)
-        class_mask = tif_crop >= threshold
 
-        target_ids = merged_class_ids[z_start:z_end, y_start:y_end, x_start:x_end]
-        target_scores = merged_class_scores[z_start:z_end, y_start:y_end, x_start:x_end]
-        update_mask = class_mask & (tif_crop > target_scores)
-        target_ids[update_mask] = class_id
-        target_scores[update_mask] = tif_crop[update_mask]
-
-    raw_visual = normalize_for_matching(merged_raw_volume) * 255.0
-    class_visual = raw_visual.copy()
-
-    num_classes = len(results)
-    if num_classes > 0:
-        for class_id in range(1, num_classes + 1):
-            class_mask = merged_class_ids == class_id
-            class_offset = 20.0 + (class_id - 1) * (100.0 / max(1, num_classes - 1))
-            class_visual[class_mask] = np.clip(
-                0.5 * raw_visual[class_mask] + 128.0 + class_offset,
-                0.0,
-                255.0,
-            )
+        target = merged_class_volume[z_start:z_end, y_start:y_end, x_start:x_end]
+        target[class_mask] = class_values[class_index]
 
     output_tif_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(output_tif_path, class_visual.astype(np.uint8), imagej=True)
+    tifffile.imwrite(output_tif_path, merged_class_volume, imagej=True)
 
 
 def main() -> None:
