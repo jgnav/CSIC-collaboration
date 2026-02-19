@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-import csv
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +8,17 @@ import cv2
 import mrcfile
 import numpy as np
 import tifffile
+
+
+MRC_PATH = Path("dataset/Annotations/20161129_SURFACTANTE_TOMO_09_norm_3DS30_bin2.mrc")
+TIF_DIR = Path("dataset/Annotations")
+TIF_PATTERN = "*.tif"
+MAX_Z_CANDIDATES = 3
+REFINE_RADIUS_Z = 3
+REFINE_RADIUS_XY = 8
+NCC_STRIDE = 8
+OUTPUT_MERGED_TIF = Path("output/merged_from_annotations.tif")
+OUTPUT_MERGED_CLASSES_TIF = Path("output/merged_from_annotations_classes.tif")
 
 
 @dataclass
@@ -206,28 +215,11 @@ def align_single_tif(
     return best_alignment
 
 
-def write_offsets_csv(results: list[AlignmentResult], output_csv_path: Path) -> None:
-    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv_path.open("w", newline="", encoding="utf-8") as csv_handle:
-        writer = csv.writer(csv_handle)
-        writer.writerow(["tif_file", "z_offset", "y_offset", "x_offset", "score"])
-        for result in results:
-            writer.writerow(
-                [
-                    result.tif_path.name,
-                    result.z_offset,
-                    result.y_offset,
-                    result.x_offset,
-                    f"{result.score:.6f}",
-                ]
-            )
-
-
 def merge_tifs_into_volume(
     results: list[AlignmentResult],
     output_volume_shape: tuple[int, int, int],
     output_tif_path: Path,
-) -> None:
+) -> np.ndarray:
     merged = np.zeros(output_volume_shape, dtype=np.float32)
     weights = np.zeros(output_volume_shape, dtype=np.float32)
 
@@ -250,81 +242,74 @@ def merge_tifs_into_volume(
     merged[valid_mask] /= weights[valid_mask]
     output_tif_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(output_tif_path, merged, imagej=True)
+    return merged
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Estimate where each TIFF stack belongs in a reference MRC volume, "
-            "write offsets, and optionally merge TIFF stacks into one reconstructed volume."
-        )
-    )
-    parser.add_argument("--mrc", type=Path, required=True, help="Path to reference .mrc full volume")
-    parser.add_argument(
-        "--tif-dir",
-        type=Path,
-        default=Path("dataset"),
-        help="Folder with partial TIFF stacks to place in the MRC volume",
-    )
-    parser.add_argument(
-        "--tif-pattern",
-        type=str,
-        default="*.tif",
-        help="Glob pattern for TIFF stacks inside --tif-dir",
-    )
-    parser.add_argument(
-        "--offsets-csv",
-        type=Path,
-        default=Path("output/tif_offsets_in_mrc.csv"),
-        help="Output CSV path for estimated offsets",
-    )
-    parser.add_argument(
-        "--max-z-candidates",
-        type=int,
-        default=3,
-        help="How many top z candidates to test before local 3D refinement",
-    )
-    parser.add_argument(
-        "--refine-radius-z",
-        type=int,
-        default=3,
-        help="Local search radius in z around each candidate",
-    )
-    parser.add_argument(
-        "--refine-radius-xy",
-        type=int,
-        default=8,
-        help="Local search radius in x/y around template match guess",
-    )
-    parser.add_argument(
-        "--ncc-stride",
-        type=int,
-        default=8,
-        help="Stride for 3D NCC scoring (higher is faster, lower is more accurate)",
-    )
-    parser.add_argument(
-        "--merged-tif",
-        type=Path,
-        default=None,
-        help="Optional output path for merged reconstructed TIFF volume",
-    )
-    parser.add_argument(
-        "--export-mrc-tif",
-        type=Path,
-        default=None,
-        help="Optional output path to export the full MRC volume as a TIFF stack",
-    )
-    return parser.parse_args()
+def merge_tifs_into_class_volume(
+    results: list[AlignmentResult],
+    merged_raw_volume: np.ndarray,
+    output_volume_shape: tuple[int, int, int],
+    output_tif_path: Path,
+) -> None:
+    merged_class_ids = np.zeros(output_volume_shape, dtype=np.uint16)
+    merged_class_scores = np.full(output_volume_shape, -np.inf, dtype=np.float32)
+
+    for class_id, result in enumerate(results, start=1):
+        tif_volume = read_volume_any(result.tif_path)
+        tif_depth, tif_height, tif_width = tif_volume.shape
+        z_start, y_start, x_start = result.z_offset, result.y_offset, result.x_offset
+        z_end = min(output_volume_shape[0], z_start + tif_depth)
+        y_end = min(output_volume_shape[1], y_start + tif_height)
+        x_end = min(output_volume_shape[2], x_start + tif_width)
+
+        if z_end <= z_start or y_end <= y_start or x_end <= x_start:
+            continue
+
+        tif_crop = tif_volume[: z_end - z_start, : y_end - y_start, : x_end - x_start]
+        tif_min = float(tif_crop.min())
+        tif_max = float(tif_crop.max())
+        if tif_max <= tif_min:
+            continue
+        threshold = 0.5 * (tif_min + tif_max)
+        class_mask = tif_crop >= threshold
+
+        target_ids = merged_class_ids[z_start:z_end, y_start:y_end, x_start:x_end]
+        target_scores = merged_class_scores[z_start:z_end, y_start:y_end, x_start:x_end]
+        update_mask = class_mask & (tif_crop > target_scores)
+        target_ids[update_mask] = class_id
+        target_scores[update_mask] = tif_crop[update_mask]
+
+    raw_visual = normalize_for_matching(merged_raw_volume) * 255.0
+    class_visual = raw_visual.copy()
+
+    num_classes = len(results)
+    if num_classes > 0:
+        for class_id in range(1, num_classes + 1):
+            class_mask = merged_class_ids == class_id
+            class_offset = 20.0 + (class_id - 1) * (100.0 / max(1, num_classes - 1))
+            class_visual[class_mask] = np.clip(
+                0.5 * raw_visual[class_mask] + 128.0 + class_offset,
+                0.0,
+                255.0,
+            )
+
+    output_tif_path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(output_tif_path, class_visual.astype(np.uint8), imagej=True)
 
 
 def main() -> None:
-    arguments = parse_args()
-    mrc_volume = read_volume_any(arguments.mrc)
+    mrc_volume = read_volume_any(MRC_PATH)
 
-    tif_paths = sorted(arguments.tif_dir.glob(arguments.tif_pattern))
+    excluded_names = {
+        OUTPUT_MERGED_TIF.name,
+        OUTPUT_MERGED_CLASSES_TIF.name,
+    }
+    tif_paths = sorted(
+        path for path in TIF_DIR.glob(TIF_PATTERN) if path.name not in excluded_names
+    )
     if not tif_paths:
         raise FileNotFoundError(
-            f"No TIFF files found in {arguments.tif_dir} with pattern {arguments.tif_pattern}"
+            f"No TIFF files found in {TIF_DIR} with pattern {TIF_PATTERN}"
         )
 
     print(f"Loaded MRC volume shape={mrc_volume.shape}, dtype={mrc_volume.dtype}")
@@ -336,31 +321,30 @@ def main() -> None:
         result = align_single_tif(
             mrc_volume=mrc_volume,
             tif_path=tif_path,
-            max_z_candidates=arguments.max_z_candidates,
-            refine_radius_z=arguments.refine_radius_z,
-            refine_radius_xy=arguments.refine_radius_xy,
-            ncc_stride=max(1, arguments.ncc_stride),
+            max_z_candidates=MAX_Z_CANDIDATES,
+            refine_radius_z=REFINE_RADIUS_Z,
+            refine_radius_xy=REFINE_RADIUS_XY,
+            ncc_stride=max(1, NCC_STRIDE),
         )
         alignment_results.append(result)
         print(
             f"  -> z={result.z_offset}, y={result.y_offset}, x={result.x_offset}, score={result.score:.5f}"
         )
 
-    write_offsets_csv(alignment_results, arguments.offsets_csv)
-    print(f"Offsets saved to: {arguments.offsets_csv}")
+    merged_volume = merge_tifs_into_volume(
+        results=alignment_results,
+        output_volume_shape=mrc_volume.shape,
+        output_tif_path=OUTPUT_MERGED_TIF,
+    )
+    print(f"Merged volume written to: {OUTPUT_MERGED_TIF}")
 
-    if arguments.merged_tif is not None:
-        merge_tifs_into_volume(
-            results=alignment_results,
-            output_volume_shape=mrc_volume.shape,
-            output_tif_path=arguments.merged_tif,
-        )
-        print(f"Merged volume written to: {arguments.merged_tif}")
-
-    if arguments.export_mrc_tif is not None:
-        arguments.export_mrc_tif.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(arguments.export_mrc_tif, mrc_volume, imagej=True)
-        print(f"Full MRC exported as TIFF stack: {arguments.export_mrc_tif}")
+    merge_tifs_into_class_volume(
+        results=alignment_results,
+        merged_raw_volume=merged_volume,
+        output_volume_shape=mrc_volume.shape,
+        output_tif_path=OUTPUT_MERGED_CLASSES_TIF,
+    )
+    print(f"Merged class volume written to: {OUTPUT_MERGED_CLASSES_TIF}")
 
 
 if __name__ == "__main__":
